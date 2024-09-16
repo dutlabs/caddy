@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - v*
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  REGISTRY: ghcr.io
+  IMAGE_NAME: dutlabs/caddy
+
+jobs:
+  release:
+    name: Create release
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.1.7
+
+      - name: Create a new GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          # Create a new GitHub Release if it does not exists
+          gh release list | grep "${{ github.ref_name }}" ||
+            gh release create "${{ github.ref_name }}" \
+              --repo="${{ github.repository }}" \
+              --title="${{ github.ref_name }}" \
+              --notes="Caddy ${{ github.ref_name }}" \
+              --verify-tag \
+              --latest
+
+  push_to_registries:
+    name: Push Docker image
+    needs: release
+    outputs:
+      image_version: ${{ steps.meta.outputs.version }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: write
+      contents: read
+      attestations: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.1.7
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3.3.0
+        with:
+          username: ${{ secrets.DUTLABS_DOCKER_USERNAME }}
+          password: ${{ secrets.DUTLABS_DOCKER_PASSWORD }}
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ env.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5.5.1
+        with:
+          images: |
+            dutlabs/caddy
+            ${{ env.REGISTRY }}/${{ github.repository }}
+
+      - name: Build and push Docker images
+        id: push
+        uses: docker/build-push-action@v6.7.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v1.4.3
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  trivy_scan:
+    name: Trivy scan
+    uses: ./.github/workflows/trivy.yml
+    needs: [push_to_registries]
+    with:
+      image-ref: ${{ github.repository }}:${{ needs.push_to_registries.outputs.image_version }}
+
+    permissions:
+      contents: read
+      security-events: write
